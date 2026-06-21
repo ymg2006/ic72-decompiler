@@ -1,0 +1,4 @@
+# Python-side PHP lexer used by the default formatter path.
+# The project still ships a built-in fallback formatter, but installing this
+# enables the best available Python PHP tokenization check.
+phply>=1.2.6

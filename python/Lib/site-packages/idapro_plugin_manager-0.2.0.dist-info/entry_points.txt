@@ -1,0 +1,2 @@
+[console_scripts]
+ippm = idapro_plugin_manager.__main__:main

@@ -1,0 +1,755 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import re
+from typing import Any, Dict, Iterable, List, Mapping, Optional
+
+from .opcodes import ALL_OPCODE_NAMES, ASSIGN_OPERATORS, BINARY_OPERATORS, CONTROL_FLOW_OPCODES, SILENT_OPCODES, opcode_name
+from .utils import operand_name, php_literal, result_key, safe_name, unwrap
+from .cfg_targets import TargetResolver
+
+@dataclass
+class Decompiler:
+    op_array: Mapping[str, Any]
+    temps: Dict[str, str] = field(default_factory=dict)
+    pending_calls: List[Dict[str, Any]] = field(default_factory=list)
+    pending_array: Optional[str] = None
+    rope_parts: Dict[str, List[str]] = field(default_factory=dict)
+    array_parts: Dict[str, List[str]] = field(default_factory=dict)
+    closure_map: Dict[str, Mapping[str, Any]] = field(default_factory=dict)
+    closure_uses: Dict[str, List[str]] = field(default_factory=dict)
+
+    @property
+    def ops(self) -> List[Mapping[str, Any]]:
+        return list(self.op_array.get("opcodes") or [])
+
+    def expr(self, operand: Mapping[str, Any] | None) -> str:
+        key = result_key(operand)
+        if key and key in self.temps:
+            return self.temps[key]
+        return operand_name(operand)
+
+    def store(self, op: Mapping[str, Any], expr: str) -> None:
+        key = result_key(op.get("result") or {})
+        if key:
+            self.temps[key] = expr
+
+    def temp_php_name(self, key: str) -> str:
+        raw = key.split(":", 1)[-1]
+        return "$_t" + safe_name(raw, "tmp")
+
+
+
+    def special_closure_body(self, oa: Mapping[str, Any]) -> Optional[List[str]]:
+        ops = list(oa.get("opcodes") or [])
+        names = [self.name(op) for op in ops]
+        # Common PHP 7.2 pattern for: function ($key) use ($arr) { return isset($arr[$key]) && $arr[$key] == "on"; }
+        if len(ops) >= 9 and names[:7] == [
+            "ZEND_RECV", "ZEND_BIND_STATIC", "ZEND_ISSET_ISEMPTY_DIM_OBJ", "ZEND_JMPZ_EX",
+            "ZEND_FETCH_DIM_R", "ZEND_IS_EQUAL", "ZEND_BOOL"
+        ]:
+            arr = self.expr(ops[1].get("op1"))
+            key = self.expr(ops[2].get("op2"))
+            rhs = self.expr(ops[5].get("op2"))
+            cond = f"isset({arr}[{key}]) && {arr}[{key}] == {rhs}"
+            # Optional ternary wrapper used by checkedAttribute.
+            if len(ops) >= 13 and names[7:13] == [
+                "ZEND_JMPZ", "ZEND_QM_ASSIGN", "ZEND_JMP", "ZEND_QM_ASSIGN", "ZEND_VERIFY_RETURN_TYPE", "ZEND_RETURN"
+            ]:
+                yes = self.expr(ops[8].get("op1"))
+                no = self.expr(ops[10].get("op1"))
+                return [f"return ({cond}) ? {yes} : {no};"]
+            return [f"return {cond};"]
+        return None
+
+    def inline_closure_expr(self, key: str) -> str:
+        oa = self.closure_map.get(key)
+        if not oa:
+            return "function () { /* missing closure body */ }"
+        args = []
+        for idx, arg in enumerate(oa.get("arg_info") or []):
+            name = safe_name(arg.get("name"), f"arg{idx}")
+            prefix = "&" if arg.get("pass_by_reference") else ""
+            args.append(prefix + "$" + name)
+        body = self.special_closure_body(oa) or Decompiler(oa, closure_map=self.closure_map).decompile()
+        body = [line for line in body if line != "return null;" and not line.startswith("/* bind static ")]
+        if not body:
+            body = ["/* empty */"]
+        indented = "\n".join("    " + line for line in body)
+        return "function (" + ", ".join(args) + ") {\n" + indented + "\n}"
+
+    def add_closure_use(self, expr: str, var: str) -> str:
+        if not expr.startswith("function ("):
+            return expr
+        use_var = var if var.startswith("$") else "$" + safe_name(var)
+        # Insert or extend a use (...) clause after the argument list.
+        close = expr.find(") {")
+        if close < 0:
+            return expr
+        header = expr[:close + 1]
+        rest = expr[close + 1:]
+        if " use (" in header:
+            if use_var not in header:
+                header = header[:-1] + ", " + use_var + ")"
+            return header + rest
+        return header + " use (" + use_var + ")" + rest
+
+    def dim_key_expr(self, operand: Mapping[str, Any] | None) -> str:
+        if not operand or operand.get("type_name") == "IS_UNUSED":
+            return ""
+        return self.expr(operand)
+
+    @property
+    def target_resolver(self) -> TargetResolver:
+        resolver = getattr(self, "_target_resolver", None)
+        if resolver is None or len(resolver.ops) != len(self.ops):
+            resolver = TargetResolver(self.ops)
+            setattr(self, "_target_resolver", resolver)
+        return resolver
+
+    def normalized_target_value(self, value: Any) -> Optional[int]:
+        rt = self.target_resolver.normalize_index(value, explicit=False)
+        return rt.index if rt is not None else None
+
+    def target_index(self, op: Mapping[str, Any]) -> Optional[int]:
+        rt = self.target_resolver.target(op)
+        return rt.index if rt is not None else None
+
+    def target_confidence(self, op: Mapping[str, Any]) -> str:
+        rt = self.target_resolver.target(op)
+        return rt.confidence if rt is not None else "unresolved"
+
+    def target(self, op: Mapping[str, Any]) -> str:
+        rt = self.target_resolver.target(op)
+        if rt is not None:
+            return str(rt.index)
+        # Keep old values visible for debugging only. These unresolved values
+        # are intentionally not treated as reliable labels/blocks.
+        for key in (
+            "jump_target_index", "false_target_index", "true_target_index",
+            "fe_reset_done_target_index", "fe_fetch_done_target_index",
+            "jmpznz_true_target_index",
+        ):
+            if op.get(key) not in (None, ""):
+                return str(op.get(key))
+        jump_targets = op.get("jump_targets") or []
+        if jump_targets:
+            first = jump_targets[0]
+            if isinstance(first, Mapping):
+                for k in ("target_index", "opline_index", "opcode_index", "index", "opline_num"):
+                    if first.get(k) is not None:
+                        return str(first.get(k))
+            return str(first)
+        for slot in ("op2", "op1", "result", "extended"):
+            o = op.get(slot) or {}
+            if isinstance(o, Mapping):
+                for k in ("jump_target_index", "target_index", "opline_index", "opcode_index", "index", "opline_num", "num"):
+                    if o.get(k) is not None:
+                        return str(o.get(k))
+        if op.get("extended_value") is not None:
+            return str(op.get("extended_value"))
+        return "?"
+
+    def reliable_label_targets(self) -> set[int]:
+        out: set[int] = set()
+        resolver = self.target_resolver
+        for op in self.ops:
+            for rt in resolver.all_targets(op):
+                out.add(rt.index)
+        return out
+
+    def op_comment(self, op: Mapping[str, Any]) -> str:
+        name = self.name(op)
+        bits = []
+        for slot in ("op1", "op2", "result"):
+            if op.get(slot):
+                bits.append(f"{slot}={self.expr(op.get(slot))}")
+        ext = op.get("extended_value")
+        if ext not in (None, 0, "0"):
+            bits.append(f"ext={ext}")
+        return "/* unsupported " + name + (" " + ", ".join(bits) if bits else "") + " */"
+
+    def name(self, op: Mapping[str, Any]) -> str:
+        return opcode_name(op.get("opcode_name", op.get("opcode", op.get("opcode_id"))))
+
+    def _literal_or_expr(self, operand: Mapping[str, Any] | None) -> str:
+        if not operand:
+            return ""
+        value = unwrap((operand or {}).get("literal"))
+        if isinstance(value, str):
+            return value
+        expr = self.expr(operand)
+        if expr.startswith('"') and expr.endswith('"'):
+            return expr[1:-1]
+        return expr
+
+    def handle_call_init(self, op: Mapping[str, Any], name: str) -> None:
+        if name == "ZEND_INIT_METHOD_CALL":
+            receiver = self.expr(op.get("op1")) or "$this"
+            method = self._literal_or_expr(op.get("op2")) or "__call"
+            call_name = f"{receiver}->{method}"
+        elif name == "ZEND_INIT_STATIC_METHOD_CALL":
+            cls = self._literal_or_expr(op.get("op1")) or "self"
+            method = self._literal_or_expr(op.get("op2")) or "__callStatic"
+            call_name = f"{cls}::{method}"
+        elif name == "ZEND_INIT_DYNAMIC_CALL":
+            call_name = self.expr(op.get("op2")) or self.expr(op.get("op1")) or "callable"
+        elif name == "ZEND_INIT_USER_CALL":
+            call_name = self.expr(op.get("op2")) or self.expr(op.get("op1")) or "call_user_func"
+        else:
+            call_name = self._literal_or_expr(op.get("op2")) or self._literal_or_expr(op.get("op1")) or "callable"
+        self.pending_calls.append({"name": str(call_name).strip('"'), "args": []})
+
+    def handle_send(self, op: Mapping[str, Any]) -> None:
+        if not self.pending_calls:
+            self.pending_calls.append({"name": "callable", "args": []})
+        arg = self.expr(op.get("op1")) or self.expr(op.get("op2")) or "null"
+        self.pending_calls[-1]["args"].append(arg)
+
+    def finish_call(self, op: Mapping[str, Any]) -> str:
+        call = self.pending_calls.pop() if self.pending_calls else {"name": "callable", "args": []}
+        expr = f"{call['name']}(" + ", ".join(call["args"]) + ")"
+        target_key = call.get("target_key")
+        if target_key:
+            self.temps[str(target_key)] = expr
+            return ""
+        self.store(op, expr)
+        return expr
+
+    def constant_name(self, operand: Mapping[str, Any] | None) -> str:
+        value = unwrap((operand or {}).get("literal"))
+        if isinstance(value, str):
+            return value
+        expr = self.expr(operand)
+        if expr.startswith('"') and expr.endswith('"'):
+            return expr[1:-1]
+        return expr
+
+    def rope_piece(self, operand: Mapping[str, Any] | None) -> str:
+        if operand and "literal" in operand:
+            return php_literal(operand.get("literal"))
+        return self.expr(operand)
+
+    def rope_expr(self, pieces: List[str]) -> str:
+        # Prefer readable heredoc for long PHP 7 rope strings when every dynamic
+        # fragment is a simple variable. Fall back to explicit concatenation for
+        # complex expressions.
+        has_newline = any(p.startswith('"') and ("\n" in p or "\r" in p) for p in pieces)
+        simple = True
+        text_parts: List[str] = []
+        import json as _json
+        for p in pieces:
+            if p.startswith('"') and p.endswith('"'):
+                try:
+                    text_parts.append(_json.loads(p).replace("$", "\\$"))
+                except Exception:
+                    simple = False
+                    break
+            elif p.startswith("$") and p.replace("_", "").replace("$", "").isalnum():
+                text_parts.append("{" + p + "}")
+            else:
+                simple = False
+                break
+        if simple and any("\n" in part or "\r" in part for part in text_parts):
+            marker = "HTML"
+            body = "".join(text_parts)
+            while marker in body:
+                marker += "_"
+            return f"<<<{marker}\n{body}\n{marker}"
+        return " . ".join(pieces)
+
+    def append_array_element(self, arr_key: str, value: str, key: str) -> None:
+        entry = f"{key} => {value}" if key else value
+        self.array_parts.setdefault(arr_key, []).append(entry)
+        self.temps[arr_key] = "[" + ", ".join(self.array_parts[arr_key]) + "]"
+
+    def decompile(self, mode: str = "structured") -> List[str]:
+        lines = self.decompile_range(0, len(self.ops), mode=mode)
+        refs = {m.group(1) for line in lines for m in [re.search(r"\bgoto L(\d+)\b", line)] if m}
+        lines = [line for line in lines if not (line.startswith("L") and line.endswith(":") and line[1:-1].isdigit() and line[1:-1] not in refs)]
+        return lines
+
+    def decompile_range(self, start: int, end: int, mode: str = "structured", suppress_labels: bool = False) -> List[str]:
+        lines: List[str] = []
+        label_targets = self.reliable_label_targets()
+        idx = start
+        while idx < end:
+            if mode != "labels":
+                foreach_block = self.try_foreach_block(idx, end, mode=mode)
+                if foreach_block is not None:
+                    block_lines, next_idx = foreach_block
+                    lines.extend(block_lines)
+                    idx = next_idx
+                    continue
+                if_block = self.try_forward_if_block(idx, end, mode=mode)
+                if if_block is not None:
+                    block_lines, next_idx = if_block
+                    lines.extend(block_lines)
+                    idx = next_idx
+                    continue
+                pattern = self.try_null_coalesce_pattern(idx)
+                if pattern is not None:
+                    lines.append(pattern)
+                    idx += 7
+                    continue
+            op = self.ops[idx]
+            if not suppress_labels and idx in label_targets:
+                lines.append(f"L{idx}:")
+            name = self.name(op)
+            statement = self.handle_op(idx, op, name)
+            if statement:
+                if isinstance(statement, list):
+                    lines.extend(statement)
+                else:
+                    lines.append(statement)
+            idx += 1
+        return lines
+
+    def condition_for_jump(self, name: str, op: Mapping[str, Any], jumped: bool) -> str:
+        cond = self.expr(op.get("op1"))
+        if name in {"ZEND_JMPZ", "ZEND_JMPZ_EX"}:
+            return f"!({cond})" if jumped else f"{cond}"
+        if name in {"ZEND_JMPNZ", "ZEND_JMPNZ_EX"}:
+            return f"{cond}" if jumped else f"!({cond})"
+        return cond
+
+    def block_has_external_jump(self, start: int, end: int) -> bool:
+        for op in self.ops[start:end]:
+            name = self.name(op)
+            if name not in {"ZEND_JMP", "ZEND_JMPZ", "ZEND_JMPNZ", "ZEND_JMPZ_EX", "ZEND_JMPNZ_EX", "ZEND_JMP_SET"}:
+                continue
+            target = self.target(op)
+            if not target.isdigit():
+                continue
+            t = int(target)
+            if t < start or t > end:
+                return True
+        return False
+
+    def try_forward_if_block(self, idx: int, limit: int, mode: str = "structured") -> Optional[tuple[List[str], int]]:
+        op = self.ops[idx]
+        name = self.name(op)
+        if name not in {"ZEND_JMPZ", "ZEND_JMPNZ", "ZEND_JMPZ_EX", "ZEND_JMPNZ_EX"}:
+            return None
+        target = self.target(op)
+        if not target.isdigit():
+            return None
+        target_idx = int(target)
+        if target_idx <= idx + 1 or target_idx > limit:
+            return None
+
+        # if/else: JMPZ else; then-body; JMP end; else-body; end
+        body_end = target_idx
+        if body_end > idx + 1 and self.name(self.ops[body_end - 1]) == "ZEND_JMP":
+            after = self.target(self.ops[body_end - 1])
+            if after.isdigit():
+                after_idx = int(after)
+                if target_idx < after_idx <= limit and not self.block_has_external_jump(idx + 1, body_end - 1):
+                    cond = self.condition_for_jump(name, op, jumped=False)
+                    then_body = self.decompile_range(idx + 1, body_end - 1, mode=mode, suppress_labels=False) or ["/* empty */"]
+                    else_body = self.decompile_range(target_idx, after_idx, mode=mode, suppress_labels=False) or ["/* empty */"]
+                    return ([f"if ({cond}) {{"] + ["    " + line for line in then_body] + ["} else {"] + ["    " + line for line in else_body] + ["}"], after_idx)
+
+        # simple if: JMPZ after; then-body; after
+        if self.block_has_external_jump(idx + 1, target_idx):
+            return None
+        body = self.decompile_range(idx + 1, target_idx, mode=mode, suppress_labels=False)
+        if not body:
+            return None
+        cond = self.condition_for_jump(name, op, jumped=False)
+        return ([f"if ({cond}) {{"] + ["    " + line for line in body] + ["}"], target_idx)
+
+    def try_foreach_block(self, idx: int, limit: int, mode: str = "structured") -> Optional[tuple[List[str], int]]:
+        ops = self.ops
+        if idx + 1 >= limit:
+            return None
+        reset = ops[idx]
+        fetch = ops[idx + 1]
+        if self.name(reset) not in {"ZEND_FE_RESET_R", "ZEND_FE_RESET_RW"}:
+            return None
+        if self.name(fetch) not in {"ZEND_FE_FETCH_R", "ZEND_FE_FETCH_RW"}:
+            return None
+        reset_target = self.target_resolver.target(reset, preferred_keys=("fe_reset_done_target_index", "jump_target_index"), slots=("op2",))
+        fetch_target = self.target_resolver.target(fetch, preferred_keys=("fe_fetch_done_target_index", "jump_target_index"), slots=()) or self.target_resolver.extended_target(fetch)
+        target = reset_target or fetch_target
+        if target is None:
+            return None
+        free_idx = int(target.index)
+        if free_idx <= idx + 1 or free_idx >= len(ops):
+            return None
+        if self.name(ops[free_idx]) != "ZEND_FE_FREE":
+            return None
+
+        iterable = self.expr(reset.get("op1"))
+        value = self.expr(fetch.get("op2"))
+        key_expr = ""
+        body_start = idx + 2
+
+        # PHP 7 foreach($arr as $key => $value) often appears as:
+        # FE_FETCH result=temp; ASSIGN $key = temp; ...
+        fetch_result = result_key(fetch.get("result") or {})
+        if fetch_result and body_start < free_idx and self.name(ops[body_start]) == "ZEND_ASSIGN":
+            assign = ops[body_start]
+            if result_key(assign.get("op2") or {}) == fetch_result:
+                key_expr = self.expr(assign.get("op1"))
+                body_start += 1
+
+        # Drop the VM loop-back jump immediately before FE_FREE. This jump is
+        # not source-level PHP and is what previously left foreach endings as
+        # confusing goto/comment pairs.
+        body_end = free_idx
+        if body_end > body_start and self.name(ops[body_end - 1]) == "ZEND_JMP":
+            body_end -= 1
+
+        header = f"foreach ({iterable} as "
+        if key_expr:
+            header += f"{key_expr} => {value}) {{"
+        else:
+            header += f"{value}) {{"
+        body = self.decompile_range(body_start, body_end, mode=mode, suppress_labels=False)
+        body = self.rewrite_loop_control_in_body(body, break_label=str(free_idx), continue_label=str(idx + 1))
+        if not body:
+            body = ["/* empty */"]
+        block = [header] + ["    " + line for line in body] + ["}"]
+        return block, free_idx + 1
+
+
+    def rewrite_loop_control_in_body(self, body: List[str], break_label: str, continue_label: str) -> List[str]:
+        out: List[str] = []
+        for line in body:
+            stripped = line.strip()
+            indent = line[:len(line) - len(line.lstrip())]
+            if stripped == f"goto L{break_label};":
+                out.append(indent + "break;")
+                continue
+            if stripped == f"goto L{continue_label};":
+                out.append(indent + "continue;")
+                continue
+            m = re.match(r"if \((.*)\) goto L(\d+);$", stripped)
+            if m and m.group(2) == str(break_label):
+                out.append(indent + f"if ({m.group(1)}) {{ break; }}")
+                continue
+            if m and m.group(2) == str(continue_label):
+                out.append(indent + f"if ({m.group(1)}) {{ continue; }}")
+                continue
+            out.append(line)
+        return out
+
+    def try_null_coalesce_pattern(self, idx: int) -> Optional[str]:
+        ops = self.ops
+        if idx + 6 >= len(ops):
+            return None
+        names = [self.name(ops[idx + off]) for off in range(7)]
+        if names != [
+            "ZEND_ISSET_ISEMPTY_DIM_OBJ",
+            "ZEND_JMPZ",
+            "ZEND_QM_ASSIGN",
+            "ZEND_JMP",
+            "ZEND_FETCH_DIM_R",
+            "ZEND_QM_ASSIGN",
+            "ZEND_ASSIGN",
+        ]:
+            return None
+        isset_op, _jmpz, false_qm, _jmp, fetch_op, true_qm, assign_op = [ops[idx + off] for off in range(7)]
+        if result_key(false_qm.get("result") or {}) != result_key(true_qm.get("result") or {}):
+            return None
+        if result_key(assign_op.get("op2") or {}) != result_key(false_qm.get("result") or {}):
+            return None
+        container = self.expr(isset_op.get("op1"))
+        key = self.expr(isset_op.get("op2"))
+        fetch_expr = f"{container}[{key}]"
+        fallback = self.expr(false_qm.get("op1"))
+        target = self.expr(assign_op.get("op1"))
+        # Keep the recovered PHP version-neutral; PHP 7.2 supports both this
+        # ternary form and ??, but the explicit isset form mirrors the opcodes.
+        return f"{target} = isset({fetch_expr}) ? {fetch_expr} : {fallback};"
+
+    def handle_op(self, idx: int, op: Mapping[str, Any], name: str) -> str | List[str] | None:
+        if name not in ALL_OPCODE_NAMES:
+            return self.op_comment(op)
+        if name in SILENT_OPCODES:
+            return None
+        if name in BINARY_OPERATORS:
+            expr = f"({self.expr(op.get('op1'))} {BINARY_OPERATORS[name]} {self.expr(op.get('op2'))})"
+            self.store(op, expr)
+            return None
+        if name in ASSIGN_OPERATORS:
+            return f"{self.expr(op.get('op1'))} {ASSIGN_OPERATORS[name]} {self.expr(op.get('op2'))};"
+        if name == "ZEND_ASSIGN":
+            left = self.expr(op.get("op1"))
+            right = self.expr(op.get("op2"))
+            self.store(op, left)
+            return f"{left} = {right};"
+        if name == "ZEND_ASSIGN_REF":
+            return f"{self.expr(op.get('op1'))} =& {self.expr(op.get('op2'))};"
+        if name == "ZEND_QM_ASSIGN":
+            key = result_key(op.get("result") or {})
+            value = self.expr(op.get("op1"))
+            if key:
+                temp = self.temp_php_name(key)
+                self.temps[key] = temp
+                return f"{temp} = {value};"
+            self.store(op, value)
+            return None
+        if name == "ZEND_CAST":
+            casts = {0: "int", 1: "bool", 2: "string", 3: "array", 4: "object", 5: "float", 6: "unset"}
+            cast = casts.get(int(op.get("extended_value") or 0), "mixed")
+            self.store(op, f"(({cast}) {self.expr(op.get('op1'))})")
+            return None
+        if name in {"ZEND_BOOL_NOT", "ZEND_BW_NOT", "ZEND_BOOL"}:
+            sym = {"ZEND_BOOL_NOT": "!", "ZEND_BW_NOT": "~", "ZEND_BOOL": "(bool)"}[name]
+            self.store(op, f"{sym}{self.expr(op.get('op1'))}")
+            return None
+        if name in {"ZEND_PRE_INC", "ZEND_PRE_INC_OBJ"}:
+            return f"++{self.expr(op.get('op1'))};"
+        if name in {"ZEND_PRE_DEC", "ZEND_PRE_DEC_OBJ"}:
+            return f"--{self.expr(op.get('op1'))};"
+        if name in {"ZEND_POST_INC", "ZEND_POST_INC_OBJ"}:
+            return f"{self.expr(op.get('op1'))}++;"
+        if name in {"ZEND_POST_DEC", "ZEND_POST_DEC_OBJ"}:
+            return f"{self.expr(op.get('op1'))}--;"
+        if name == "ZEND_ECHO":
+            return f"echo {self.expr(op.get('op1'))};"
+        if name in {"ZEND_RETURN", "ZEND_RETURN_BY_REF", "ZEND_GENERATOR_RETURN"}:
+            prefix = "return &" if name == "ZEND_RETURN_BY_REF" else "return "
+            return prefix + (self.expr(op.get("op1")) or "null") + ";"
+        if name == "ZEND_EXIT":
+            return "exit(" + (self.expr(op.get("op1")) or "") + ");"
+        if name == "ZEND_THROW":
+            return f"throw {self.expr(op.get('op1'))};"
+        if name in {"ZEND_INIT_FCALL", "ZEND_INIT_FCALL_BY_NAME", "ZEND_INIT_NS_FCALL_BY_NAME", "ZEND_INIT_METHOD_CALL", "ZEND_INIT_STATIC_METHOD_CALL", "ZEND_INIT_DYNAMIC_CALL", "ZEND_INIT_USER_CALL"}:
+            self.handle_call_init(op, name)
+            return None
+        if name.startswith("ZEND_SEND_"):
+            self.handle_send(op)
+            return None
+        if name in {"ZEND_DO_FCALL", "ZEND_DO_ICALL", "ZEND_DO_UCALL", "ZEND_DO_FCALL_BY_NAME"}:
+            expr = self.finish_call(op)
+            if not expr:
+                return None
+            return None if result_key(op.get("result") or {}) else expr + ";"
+        if name == "ZEND_NEW":
+            cls = self.constant_name(op.get("op1")) or "RecoveredClass"
+            target_key = result_key(op.get("result") or {})
+            self.pending_calls.append({"name": f"new {cls}", "args": [], "target_key": target_key})
+            if target_key:
+                self.temps[target_key] = f"new {cls}()"
+            return None
+        if name == "ZEND_CLONE":
+            self.store(op, f"clone {self.expr(op.get('op1'))}")
+            return None
+        if name == "ZEND_INSTANCEOF":
+            self.store(op, f"({self.expr(op.get('op1'))} instanceof {self.expr(op.get('op2'))})")
+            return None
+        if name == "ZEND_FETCH_THIS":
+            self.store(op, "$this")
+            return None
+        if name in {"ZEND_FETCH_R", "ZEND_FETCH_W", "ZEND_FETCH_RW", "ZEND_FETCH_IS", "ZEND_FETCH_FUNC_ARG", "ZEND_FETCH_UNSET"}:
+            expr = self.expr(op.get("op1")) or self.expr(op.get("op2"))
+            if expr and not expr.startswith("$") and expr.isidentifier():
+                expr = "$" + safe_name(expr)
+            self.store(op, expr or "$var")
+            return None
+        if "FETCH_DIM" in name:
+            key = self.dim_key_expr(op.get("op2"))
+            self.store(op, f"{self.expr(op.get('op1'))}[{key}]" if key else f"{self.expr(op.get('op1'))}[]")
+            return None
+        if "FETCH_OBJ" in name:
+            prop = self.expr(op.get("op2"))
+            prop = prop[1:-1] if prop.startswith('"') and prop.endswith('"') else prop
+            self.store(op, f"{self.expr(op.get('op1'))}->{prop}")
+            return None
+        if "FETCH_STATIC_PROP" in name:
+            prop = self.expr(op.get("op1"))
+            cls = self.expr(op.get("op2")) or "self"
+            prop = prop[1:-1] if prop.startswith('"') and prop.endswith('"') else prop
+            self.store(op, f"{cls}::${prop}")
+            return None
+        if name == "ZEND_FETCH_CLASS":
+            cls = self.expr(op.get("op2")) or self.expr(op.get("op1")) or "self"
+            if cls.startswith('"') and cls.endswith('"'):
+                cls = cls[1:-1]
+            self.store(op, cls)
+            return None
+        if name == "ZEND_FETCH_CLASS_CONSTANT":
+            self.store(op, f"{self.expr(op.get('op1'))}::{self.expr(op.get('op2'))}")
+            return None
+        if name == "ZEND_FETCH_CONSTANT":
+            self.store(op, self.constant_name(op.get("op2")) or self.constant_name(op.get("op1")))
+            return None
+        if name == "ZEND_ASSIGN_DIM":
+            key = self.dim_key_expr(op.get("op2"))
+            left = f"{self.expr(op.get('op1'))}[{key}]" if key else f"{self.expr(op.get('op1'))}[]"
+            return f"{left} = {self.next_op_data(idx)};"
+        if name == "ZEND_ASSIGN_OBJ":
+            prop = self.expr(op.get("op2"))
+            prop = prop[1:-1] if prop.startswith('"') and prop.endswith('"') else prop
+            return f"{self.expr(op.get('op1'))}->{prop} = {self.next_op_data(idx)};"
+        if name in {"ZEND_UNSET_VAR", "ZEND_UNSET_DIM", "ZEND_UNSET_OBJ", "ZEND_UNSET_STATIC_PROP", "ZEND_UNSET_CV"}:
+            return f"unset({self.expr(op.get('op1'))});"
+        if name == "ZEND_INIT_ARRAY":
+            arr_key = result_key(op.get("result") or {})
+            if arr_key:
+                self.array_parts[arr_key] = []
+                value = self.expr(op.get("op1"))
+                key = self.dim_key_expr(op.get("op2"))
+                if value:
+                    self.append_array_element(arr_key, value, key)
+                else:
+                    self.temps[arr_key] = "[]"
+                self.pending_array = arr_key
+            return None
+        if name == "ZEND_ADD_ARRAY_ELEMENT":
+            arr_key = result_key(op.get("result") or {}) or self.pending_array
+            if arr_key:
+                self.append_array_element(arr_key, self.expr(op.get("op1")), self.dim_key_expr(op.get("op2")))
+            return None
+        if name == "ZEND_ROPE_INIT":
+            key = result_key(op.get("result") or {})
+            if key:
+                self.rope_parts[key] = [self.rope_piece(op.get("op2"))]
+                self.temps[key] = self.rope_expr(self.rope_parts[key])
+            return None
+        if name == "ZEND_ROPE_ADD":
+            key = result_key(op.get("result") or {}) or result_key(op.get("op1") or {})
+            source = result_key(op.get("op1") or {})
+            if key:
+                parts = list(self.rope_parts.get(source or key, []))
+                parts.append(self.rope_piece(op.get("op2")))
+                self.rope_parts[key] = parts
+                self.temps[key] = self.rope_expr(parts)
+            return None
+        if name == "ZEND_ROPE_END":
+            source = result_key(op.get("op1") or {})
+            key = result_key(op.get("result") or {}) or source
+            if key:
+                parts = list(self.rope_parts.get(source or key, []))
+                parts.append(self.rope_piece(op.get("op2")))
+                self.rope_parts[key] = parts
+                self.temps[key] = self.rope_expr(parts)
+            return None
+        if name == "ZEND_DECLARE_LAMBDA_FUNCTION":
+            lit = (op.get("op1") or {}).get("literal") or {}
+            closure_hex = lit.get("hex") if isinstance(lit, Mapping) else None
+            key = result_key(op.get("result") or {})
+            expr = self.inline_closure_expr("closure:" + str(closure_hex)) if closure_hex else "function () { /* closure */ }"
+            if key:
+                self.temps[key] = expr
+            return None
+        if name == "ZEND_BIND_LEXICAL":
+            key = result_key(op.get("op1") or {})
+            var = self.expr(op.get("op2"))
+            if key and key in self.temps:
+                self.temps[key] = self.add_closure_use(self.temps[key], var)
+            return None
+        if name == "ZEND_BIND_STATIC":
+            # In closure op_arrays this records variables imported by use(...).
+            # The outer ZEND_BIND_LEXICAL renders the actual use clause.
+            return f"/* bind static {self.expr(op.get('op1'))} */"
+        if name in {"ZEND_INCLUDE_OR_EVAL"}:
+            kind = op.get("extended_value_decoded") or "include"
+            if kind not in {"include", "include_once", "require", "require_once", "eval"}:
+                kind = "include"
+            return f"{kind} {self.expr(op.get('op1'))};"
+        if name in {"ZEND_YIELD", "ZEND_YIELD_FROM"}:
+            self.store(op, f"yield {self.expr(op.get('op1'))}")
+            return None
+        if name == "ZEND_STRLEN":
+            self.store(op, f"strlen({self.expr(op.get('op1'))})")
+            return None
+        if name == "ZEND_DEFINED":
+            self.store(op, f"defined({self.expr(op.get('op1'))})")
+            return None
+        if name == "ZEND_TYPE_CHECK":
+            self.store(op, f"/* type_check */ {self.expr(op.get('op1'))}")
+            return None
+        if name in {"ZEND_COUNT", "ZEND_GET_CLASS", "ZEND_GET_CALLED_CLASS", "ZEND_GET_TYPE", "ZEND_FUNC_NUM_ARGS", "ZEND_FUNC_GET_ARGS"}:
+            fn = name[5:].lower()
+            self.store(op, f"{fn}({self.expr(op.get('op1'))})")
+            return None
+        if name in {"ZEND_ISSET_ISEMPTY_VAR", "ZEND_ISSET_ISEMPTY_CV"}:
+            self.store(op, f"isset({self.expr(op.get('op1'))})")
+            return None
+        if name == "ZEND_ISSET_ISEMPTY_DIM_OBJ":
+            self.store(op, f"isset({self.expr(op.get('op1'))}[{self.expr(op.get('op2'))}])")
+            return None
+        if name == "ZEND_ISSET_ISEMPTY_PROP_OBJ":
+            prop = self.expr(op.get("op2"))
+            prop = prop[1:-1] if prop.startswith('"') and prop.endswith('"') else prop
+            self.store(op, f"isset({self.expr(op.get('op1'))}->{prop})")
+            return None
+        if name in {"ZEND_ISSET_ISEMPTY_STATIC_PROP", "ZEND_ISSET_ISEMPTY_THIS"}:
+            self.store(op, f"isset({self.expr(op.get('op1'))})")
+            return None
+        if name == "ZEND_BIND_GLOBAL":
+            left = self.expr(op.get("op1"))
+            global_name = self.constant_name(op.get("op2")) or left.lstrip("$")
+            if left and left.startswith("$"):
+                return f"global ${safe_name(global_name, left.lstrip('$'))};"
+            return f"global ${safe_name(global_name, 'globalVar')};"
+        if name == "ZEND_FETCH_CLASS_NAME":
+            self.store(op, "static::class")
+            return None
+        if name == "ZEND_FETCH_LIST":
+            source = self.expr(op.get("op1"))
+            key = self.dim_key_expr(op.get("op2"))
+            self.store(op, f"{source}[{key}]")
+            return None
+        if name == "ZEND_BEGIN_SILENCE":
+            key = result_key(op.get("result") or {})
+            if key:
+                self.temps[key] = "/* silence */"
+            return None
+        if name == "ZEND_END_SILENCE":
+            return None
+        if name == "ZEND_SEPARATE":
+            self.store(op, self.expr(op.get("op1")))
+            return None
+        if name == "ZEND_MAKE_REF":
+            self.store(op, "&" + self.expr(op.get("op1")))
+            return None
+        if name == "ZEND_IN_ARRAY":
+            # PHP uses a specialized opcode for in_array/array-key membership.
+            needle = self.expr(op.get("op1"))
+            haystack = self.expr(op.get("op2"))
+            strict = ", true" if int(op.get("extended_value") or 0) else ""
+            self.store(op, f"in_array({needle}, {haystack}{strict})")
+            return None
+        if name == "ZEND_GENERATOR_CREATE":
+            return None
+        if name == "ZEND_CATCH":
+            cls = self.constant_name(op.get("op1")) or "Exception"
+            var = self.expr(op.get("op2")) or "$e"
+            if not var.startswith("$"):
+                var = "$" + safe_name(var, "e")
+            return f"catch ({cls} {var}) {{"
+        if name in CONTROL_FLOW_OPCODES:
+            return self.control_comment(name, op)
+        return self.op_comment(op)
+
+    def next_op_data(self, idx: int) -> str:
+        ops = self.ops
+        if idx + 1 < len(ops) and self.name(ops[idx + 1]) == "ZEND_OP_DATA":
+            return self.expr(ops[idx + 1].get("op1")) or self.expr(ops[idx + 1].get("op2")) or "null"
+        return "/* missing ZEND_OP_DATA */ null"
+
+    def control_comment(self, name: str, op: Mapping[str, Any]) -> str:
+        if name == "ZEND_JMP":
+            return f"goto L{self.target(op)};"
+        if name in {"ZEND_JMPZ", "ZEND_JMPNZ", "ZEND_JMPZ_EX", "ZEND_JMPNZ_EX", "ZEND_JMP_SET"}:
+            cond = self.expr(op.get("op1"))
+            neg = "!" if name in {"ZEND_JMPZ", "ZEND_JMPZ_EX"} else ""
+            return f"if ({neg}{cond}) goto L{self.target(op)};"
+        if name in {"ZEND_SWITCH_LONG", "ZEND_SWITCH_STRING"}:
+            return f"/* switch on {self.expr(op.get('op1'))}; jump table target {self.target(op)} */"
+        if name == "ZEND_FE_RESET_R" or name == "ZEND_FE_RESET_RW":
+            return f"/* foreach over {self.expr(op.get('op1'))} */"
+        if name == "ZEND_FE_FETCH_R" or name == "ZEND_FE_FETCH_RW":
+            return f"/* foreach value {self.expr(op.get('op2'))} */"
+        if name == "ZEND_FE_FREE":
+            return "/* endforeach */"
+        if name == "ZEND_FAST_CALL":
+            return f"/* finally call L{self.target(op)} */"
+        if name == "ZEND_FAST_RET":
+            return "/* finally return */"
+        return self.op_comment(op)

@@ -1,135 +1,96 @@
 from __future__ import annotations
 
+import json
 import re
-from typing import Any, Optional
+from typing import Any, Mapping
 
+_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-IDENT_RE = re.compile(r"^[A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*$")
+def unwrap(value: Any) -> Any:
+    """Unwrap ic72dump typed value records to their native value.
 
+    The JSON dumper represents constants/literals as dictionaries such as
+    {"type": "string", "value": "foo", ...metadata...}.  Older code only
+    unwrapped very small records, which caused full metadata dictionaries to be
+    emitted into recovered PHP.
+    """
+    seen = 0
+    while isinstance(value, Mapping) and "value" in value and seen < 16:
+        # Typed scalar/null/array records from ic72dump.  Do not unwrap arbitrary
+        # user dictionaries unless they look like dumper value wrappers.
+        if any(k in value for k in ("type", "printable", "preview", "hex", "base64", "sha1", "length", "index")):
+            value = value.get("value")
+            seen += 1
+            continue
+        if len(value) <= 3:
+            value = value.get("value")
+            seen += 1
+            continue
+        break
+    return value
 
-def unwrap(v: Any) -> Any:
-    if not isinstance(v, dict) or "type" not in v:
-        return v
-    t = v.get("type")
-    if t == "string":
-        if v.get("value") is not None:
-            return v.get("value")
-        hx = str(v.get("hex", ""))
-        try:
-            decoded = bytes.fromhex(hx).decode("utf-8")
-            if all(ord(ch) >= 32 or ch in "\r\n\t" for ch in decoded):
-                return decoded
-        except Exception:
-            pass
-        return "_obf_" + hx
-    if t in ("int", "float", "bool", "null"):
-        return v.get("value")
-    if t == "array":
-        val = v.get("value")
-        if isinstance(val, list):
-            return [unwrap(x) for x in val]
-        if isinstance(val, dict):
-            return {k: unwrap(x) for k, x in val.items()}
-    return v.get("value")
-
-
-def php_string(s: str) -> str:
-    return '"' + s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r") + '"'
-
-
-def php_literal(v: Any) -> str:
-    v = unwrap(v)
-    if v is None:
+def php_literal(value: Any) -> str:
+    value = unwrap(value)
+    if value is None:
         return "null"
-    if v is True:
+    if value is True:
         return "true"
-    if v is False:
+    if value is False:
         return "false"
-    if isinstance(v, int):
-        return str(v)
-    if isinstance(v, float):
-        return repr(v)
-    if isinstance(v, str):
-        return php_string(v)
-    if isinstance(v, list):
-        return "[" + ", ".join(php_literal(x) for x in v) + "]"
-    if isinstance(v, dict):
-        parts = [php_literal(k) + " => " + php_literal(x) for k, x in v.items()]
-        return "[" + ", ".join(parts) + "]"
-    return php_string(str(v))
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, list):
+        return "[" + ", ".join(php_literal(v) for v in value) + "]"
+    if isinstance(value, dict):
+        items = []
+        for k, v in value.items():
+            items.append(f"{php_literal(k)} => {php_literal(v)}")
+        return "[" + ", ".join(items) + "]"
+    return json.dumps(str(value), ensure_ascii=False)
 
+def safe_name(name: Any, fallback: str = "var") -> str:
+    name = unwrap(name)
+    if not isinstance(name, str) or not name:
+        return fallback
+    name = name.strip().lstrip("$").replace("\\", "_")
+    name = re.sub(r"[^A-Za-z0-9_]", "_", name)
+    if not name or not re.match(r"^[A-Za-z_]", name):
+        name = "_" + name
+    return name
 
-def safe_name(v: Any, fallback: str) -> str:
-    v = unwrap(v)
-    if isinstance(v, str) and IDENT_RE.match(v):
-        return v
-    return fallback
+def is_identifier(name: str) -> bool:
+    return bool(_IDENT.match(name))
 
+def operand_name(op: Mapping[str, Any] | None) -> str:
+    if not op:
+        return ""
+    if op.get("cv_name"):
+        return "$" + safe_name(op.get("cv_name"), "var")
+    if op.get("name"):
+        name = str(op.get("name"))
+        return "$" + safe_name(name, "var") if not name.startswith("$") else "$" + safe_name(name, "var")
+    if "literal" in op:
+        return php_literal(op.get("literal"))
+    if "constant" in op and op.get("type_name") not in {"IS_UNUSED", "IS_TMP_VAR", "IS_VAR"}:
+        return php_literal(op.get("constant"))
+    t = op.get("type_name") or op.get("type") or "op"
+    n = op.get("var", op.get("constant", op.get("num", "")))
+    if t in {"IS_TMP_VAR", "IS_VAR"}:
+        return f"$_t{n}"
+    if t == "IS_CV":
+        return f"$cv{n}"
+    return str(n) if n != "" else ""
 
-def decode_hex_name_from_id(prefix: str, key: str) -> Optional[str]:
-    if prefix not in key:
+def result_key(op: Mapping[str, Any] | None) -> str | None:
+    if not op:
         return None
-    tail = key.split(prefix, 1)[1].split(":", 1)[0]
-    try:
-        return bytes.fromhex(tail).decode("utf-8", "replace")
-    except ValueError:
-        return None
-
-
-def strip_redundant_parens(expr: str) -> str:
-    expr = expr.strip()
-
-    def balanced(s: str) -> bool:
-        depth = 0
-        quote = ""
-        escape = False
-        for ch in s:
-            if quote:
-                if escape:
-                    escape = False
-                elif ch == "\\":
-                    escape = True
-                elif ch == quote:
-                    quote = ""
-                continue
-            if ch in ("'", '"'):
-                quote = ch
-            elif ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-                if depth < 0:
-                    return False
-        return depth == 0 and not quote
-
-    changed = True
-    while changed:
-        changed = False
-        while expr.startswith("(") and expr.endswith(")") and balanced(expr[1:-1]):
-            expr = expr[1:-1].strip()
-            changed = True
-        # Flatten left-associative logical chains: ((a && b) && c) -> a && b && c.
-        for op in ("&&", "||"):
-            marker = f") {op} "
-            if expr.startswith("(") and marker in expr:
-                idx = expr.find(marker)
-                left = expr[1:idx]
-                right = expr[idx + len(marker):]
-                # Never flatten (a || b) && c: PHP gives && higher
-                # precedence than ||, so removing those parens changes meaning.
-                if op == "&&" and "||" in left:
-                    continue
-                if balanced(left) and op in left and ("&&" not in right if op == "||" else "||" not in right):
-                    expr = f"{left} {op} {right}".strip()
-                    changed = True
-                    break
-        if expr.startswith("!(") and expr.endswith(")") and balanced(expr[2:-1]):
-            inner = expr[2:-1].strip()
-            if re.match(r"^(empty|isset|is_[A-Za-z0-9_]+)\(.+\)$", inner):
-                expr = "!" + inner
-                changed = True
-        cleaned = re.sub(r"!\(([A-Za-z_][A-Za-z0-9_]*\([^()]*\))\)", r"!\1", expr)
-        if cleaned != expr:
-            expr = cleaned
-            changed = True
-    return expr
+    t = op.get("type_name") or op.get("type")
+    if t in {"IS_TMP_VAR", "IS_VAR", "IS_CV"}:
+        n = op.get("var", op.get("constant", op.get("num")))
+        if n is not None:
+            return f"{t}:{n}"
+    if op.get("cv_name"):
+        return "CV:" + safe_name(op.get("cv_name"), "var")
+    return None

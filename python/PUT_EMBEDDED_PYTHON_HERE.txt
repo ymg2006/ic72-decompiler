@@ -1,0 +1,6 @@
+Place the official Windows embeddable Python runtime in this folder so that this exists:
+
+    python\python.exe
+
+The bundled decompile.bat will use python\python.exe first.
+You can also run ..\setup_embedded_python.bat to download and unpack the official x64 embeddable Python runtime automatically.
